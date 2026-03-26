@@ -182,6 +182,7 @@ struct MeshData {
     uint32_t    dest;
     uint32_t    source;
     uint32_t    request_id;
+    uint32_t    bitfield;         // field 9: bit 0 = ok_to_mqtt
 };
 
 /**
@@ -226,6 +227,12 @@ static inline bool meshDecodeData(const uint8_t *buf, size_t len, MeshData *out)
             }
             case 6: { // request_id (fixed32)
                 if (!c.readFixed32(&out->request_id)) return false;
+                break;
+            }
+            case 9: { // bitfield (varint) — bit 0 = ok_to_mqtt
+                uint64_t v;
+                if (!c.readVarint(&v)) return false;
+                out->bitfield = (uint32_t)v;
                 break;
             }
             default:
@@ -313,7 +320,7 @@ struct MeshUser {
     char     id[16];         // e.g., "!aabbccdd"   (string, field 1)
     char     long_name[40];  // human name            (string, field 2)
     char     short_name[5];  // 3-char abbreviation   (string, field 3)
-    uint16_t hw_model;       // HardwareModel enum    (varint, field 6)
+    uint16_t hw_model;       // HardwareModel enum    (varint, field 5)
     uint8_t  public_key[32]; //                        (bytes, field 8)
     uint8_t  public_key_len;
 };
@@ -337,7 +344,7 @@ static inline bool meshDecodeUser(const uint8_t *buf, size_t len, MeshUser *out)
             case 3: // short_name
                 if (!c.readString(out->short_name, sizeof(out->short_name), &slen)) return false;
                 break;
-            case 6: { // hw_model
+            case 5: { // hw_model
                 uint64_t v;
                 if (!c.readVarint(&v)) return false;
                 out->hw_model = (uint16_t)v;
@@ -498,7 +505,8 @@ static inline PbWriter pbWriter(uint8_t *buf, size_t capacity) {
 static inline size_t meshEncodeData(uint8_t *buf, size_t capacity,
                                      MeshPortNum portnum,
                                      const uint8_t *payload, size_t payload_len,
-                                     bool want_response = false)
+                                     bool want_response = false,
+                                     bool ok_to_mqtt = false)
 {
     PbWriter w = pbWriter(buf, capacity);
     if (!w.writeVarintField(1, (uint64_t)portnum)) return 0;
@@ -506,5 +514,27 @@ static inline size_t meshEncodeData(uint8_t *buf, size_t capacity,
         if (!w.writeBytes(2, payload, payload_len)) return 0;
     if (want_response)
         if (!w.writeVarintField(3, 1)) return 0;
+    if (ok_to_mqtt)
+        if (!w.writeVarintField(9, 1)) return 0;  // bitfield bit 0 = ok_to_mqtt
+    return w.written();
+}
+
+/**
+ * Encode a meshtastic.User protobuf.
+ * Fields match meshDecodeUser: 1=id, 2=long_name, 3=short_name, 5=hw_model, 8=public_key.
+ * Returns encoded length, or 0 on failure.
+ */
+static inline size_t meshEncodeUser(uint8_t *buf, size_t capacity,
+                                     const char *id, const char *long_name,
+                                     const char *short_name, uint16_t hw_model,
+                                     const uint8_t *public_key = nullptr,
+                                     uint8_t public_key_len = 0) {
+    PbWriter w = pbWriter(buf, capacity);
+    if (id && id[0])              if (!w.writeString(1, id)) return 0;
+    if (long_name && long_name[0]) if (!w.writeString(2, long_name)) return 0;
+    if (short_name && short_name[0]) if (!w.writeString(3, short_name)) return 0;
+    if (hw_model)                 if (!w.writeVarintField(5, hw_model)) return 0;
+    if (public_key && public_key_len > 0)
+        if (!w.writeBytes(8, public_key, public_key_len)) return 0;
     return w.written();
 }

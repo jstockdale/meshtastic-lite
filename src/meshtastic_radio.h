@@ -259,9 +259,9 @@ struct MeshPacketIdGen {
 struct MeshRxResult {
     MeshRxPacket packet;      // parsed header + raw/decrypted payload
     MeshData     data;        // decoded Data envelope
-    int8_t       channel_idx; // which channel matched (-1 if none/PKI)
+    int8_t       channel_idx; // which channel matched (-1 if none / PKI)
     bool         decrypted;   // true if decryption succeeded
-    bool         pki_encrypted; // true if decrypted via PKI (DM)
+    bool         is_pki;      // true if decrypted via PKI (not channel)
 };
 
 struct MeshSession {
@@ -269,9 +269,9 @@ struct MeshSession {
     MeshModemPreset   preset;
     MeshRole          role;
     uint32_t          node_num;     // our node address (bottom 4 bytes of MAC)
-    int32_t           freq_slot;    // -1 = hash-based, >= 0 = explicit slot override
     MeshChannelTable  channels;
     MeshPacketIdGen   id_gen;
+    int32_t           freq_slot;    // -1 = hash-based, >= 0 = explicit slot override
 
     // PKI state
     MeshPkiIdentity   pki;          // our x25519 keypair
@@ -334,7 +334,7 @@ struct MeshSession {
                     result->data.portnum != PORT_UNKNOWN)
                 {
                     decrypted = true;
-                    result->pki_encrypted = true;
+                    result->is_pki = true;
                     result->channel_idx = -1; // not a channel-based message
                 }
             }
@@ -374,22 +374,29 @@ struct MeshSession {
 
     /**
      * Build a channel-encrypted TX frame (broadcast or group message).
+     *
+     * `ok_to_mqtt`: set ok_to_mqtt in Data protobuf bitfield (signals MQTT gateways to forward)
+     * `tx_hop_limit`: hop count for mesh propagation (1-7, default 3)
+     *
      * Returns total frame length, or 0 on failure.
      */
     size_t buildTx(uint8_t channel_idx,
                     uint32_t to,
                     MeshPortNum portnum,
                     const uint8_t *payload, size_t payload_len,
-                    bool want_ack,
-                    uint8_t *out)
+                    bool want_ack, bool ok_to_mqtt,
+                    uint8_t *out,
+                    uint8_t tx_hop_limit = MESH_HOP_RELIABLE)
     {
-        if (role == ROLE_CLIENT_MUTE) return 0;
+        // Note: ROLE_CLIENT_MUTE only suppresses rebroadcasting others' packets,
+        // not originating our own. Relay filtering happens in the RX path.
         if (channel_idx >= channels.count) return 0;
 
-        // Encode Data protobuf
+        // Encode Data protobuf — ok_to_mqtt goes in Data.bitfield (field 9, bit 0)
         uint8_t data_buf[240];
         size_t data_len = meshEncodeData(data_buf, sizeof(data_buf),
-                                          portnum, payload, payload_len);
+                                          portnum, payload, payload_len,
+                                          false, ok_to_mqtt);
         if (data_len == 0) return 0;
 
         // Encrypt with channel PSK
@@ -401,13 +408,17 @@ struct MeshSession {
                 return 0;
         }
 
-        uint8_t hop_limit = MESH_HOP_RELIABLE;
+        // Build frame — hop_start always equals hop_limit for originating packets
+        // via_mqtt=false: we never originate from MQTT (via_mqtt means "came from MQTT")
+        uint8_t hop_limit = tx_hop_limit & 0x07;  // clamp to 3-bit field
+        uint8_t hop_start = hop_limit;
+
         return meshBuildPacket(out,
                                 to, node_num, pkt_id,
-                                hop_limit, hop_limit,
-                                want_ack, false,
+                                hop_limit, hop_start,
+                                want_ack, false,  // via_mqtt=false always
                                 ch->hash,
-                                0, 0,
+                                0, 0,  // next_hop, relay_node
                                 data_buf, data_len);
     }
 
@@ -423,9 +434,9 @@ struct MeshSession {
                       const uint8_t *payload, size_t payload_len,
                       bool want_ack,
                       uint8_t *out,
-                      uint32_t (*rand_fn)(void))
+                      uint32_t (*rand_fn)(void),
+                      uint8_t tx_hop_limit = MESH_HOP_RELIABLE)
     {
-        if (role == ROLE_CLIENT_MUTE) return 0;
         if (!pki.initialized) return 0;
 
         // Look up recipient's public key
@@ -448,11 +459,12 @@ struct MeshSession {
         if (enc_len == 0) return 0;
 
         // PKI DMs use channel_hash=0 (Router.cpp:453)
-        uint8_t hop_limit = MESH_HOP_RELIABLE;
+        uint8_t hop_limit = tx_hop_limit & 0x07;
+        uint8_t hop_start = hop_limit;
         return meshBuildPacket(out,
                                 to_node, node_num, pkt_id,
-                                hop_limit, hop_limit,
-                                want_ack, false,
+                                hop_limit, hop_start,
+                                want_ack, false,  // via_mqtt=false always
                                 0,  // channel_hash = 0 for PKI DMs
                                 0, 0,
                                 encrypted, enc_len);
@@ -462,21 +474,47 @@ struct MeshSession {
      * Convenience: send a text DM via PKI.
      */
     size_t buildTextDm(uint32_t to_node, const char *text, bool want_ack,
-                        uint8_t *out, uint32_t (*rand_fn)(void))
+                        uint8_t *out, uint32_t (*rand_fn)(void),
+                        uint8_t tx_hop_limit = MESH_HOP_RELIABLE)
     {
         return buildDmTx(to_node, PORT_TEXT_MESSAGE,
                           (const uint8_t *)text, strlen(text),
-                          want_ack, out, rand_fn);
+                          want_ack, out, rand_fn, tx_hop_limit);
     }
 
     /**
-     * Convenience: build a text broadcast on a channel.
+     * Convenience: build a text message TX frame.
      */
     size_t buildTextTx(uint8_t channel_idx, uint32_t to,
-                        const char *text, bool want_ack,
-                        uint8_t *out)
+                        const char *text, bool want_ack, bool ok_to_mqtt,
+                        uint8_t *out,
+                        uint8_t tx_hop_limit = MESH_HOP_RELIABLE)
     {
         return buildTx(channel_idx, to, PORT_TEXT_MESSAGE,
-                        (const uint8_t *)text, strlen(text), want_ack, out);
+                        (const uint8_t *)text, strlen(text), want_ack, ok_to_mqtt, out,
+                        tx_hop_limit);
+    }
+
+    /**
+     * Convenience: build a NODEINFO TX frame.
+     * Encodes a User protobuf with the given identity fields.
+     */
+    size_t buildNodeInfoTx(uint8_t channel_idx, uint32_t to,
+                            const char *id, const char *long_name,
+                            const char *short_name, uint16_t hw_model,
+                            bool want_ack, bool ok_to_mqtt,
+                            uint8_t *out,
+                            const uint8_t *public_key = nullptr,
+                            uint8_t public_key_len = 0,
+                            uint8_t tx_hop_limit = MESH_HOP_RELIABLE)
+    {
+        uint8_t user_buf[160];  // 128 + 32 for public key
+        size_t user_len = meshEncodeUser(user_buf, sizeof(user_buf),
+                                          id, long_name, short_name, hw_model,
+                                          public_key, public_key_len);
+        if (user_len == 0) return 0;
+        return buildTx(channel_idx, to, PORT_NODEINFO,
+                        user_buf, user_len, want_ack, ok_to_mqtt, out,
+                        tx_hop_limit);
     }
 };

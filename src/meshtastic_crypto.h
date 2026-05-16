@@ -126,8 +126,8 @@ static inline bool meshCryptCtr(const MeshCryptoKey *key,
             data[offset + i] ^= keystream[i];
         }
 
-        // Increment the 32-bit counter in bytes [12..15] (little-endian)
-        for (int i = 12; i < 16; i++) {
+        // Increment the 32-bit counter in bytes [12..15] (big-endian)
+        for (int i = 15; i >= 12; i--) {
             if (++counter_block[i] != 0) break;
         }
     }

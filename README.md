@@ -166,7 +166,7 @@ The implementation has been verified against the Meshtastic firmware source and 
 
 | Feature | Reference | Status |
 |---|---|---|
-| AES-CTR nonce layout | `[packetId(8B LE)][fromNode(4B LE)][counter(4B LE)]` | ✓ Matches CryptoEngine.cpp |
+| AES-CTR nonce layout | `[packetId(8B LE)][fromNode(4B LE)][counter(4B, BE increment)]` | ✓ Matches CryptoEngine.cpp |
 | Packet header | 16 bytes packed: to, from, id, flags, channel, hop, relay | ✓ Matches RadioInterface.h |
 | Channel hash | `XOR(name_bytes) ^ XOR(expanded_key_bytes)` | ✓ Matches Channels.cpp |
 | PSK expansion | Single-byte index → well-known key, 16/32-byte direct | ✓ Matches Channels.cpp |
